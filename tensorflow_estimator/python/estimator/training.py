@@ -23,6 +23,8 @@ import json
 import os
 import time
 
+import tensorflow as tf
+
 import six
 
 from tensorflow.core.protobuf import config_pb2
@@ -37,6 +39,7 @@ from tensorflow.python.training import server_lib
 from tensorflow.python.training import session_run_hook
 from tensorflow.python.util import compat
 from tensorflow.python.util.tf_export import estimator_export
+from tensorflow.python.eager import context
 
 _MAX_DELAY_SECS = 60
 _DELAY_SECS_PER_WORKER = 5
@@ -172,7 +175,7 @@ class TrainSpec(
 @estimator_export('estimator.EvalSpec')
 class EvalSpec(
     collections.namedtuple('EvalSpec', [
-        'input_fn', 'steps', 'name', 'hooks', 'exporters', 'start_delay_secs',
+        'input_fn', 'input_fns','start_multi_eval','steps', 'name', 'hooks', 'exporters', 'start_delay_secs',
         'throttle_secs'
     ])):
   """Configuration for the "eval" part for the `train_and_evaluate` call.
@@ -182,9 +185,11 @@ class EvalSpec(
   the trained model.  Export writes out the trained model on to external
   storage.
   """
-
+  # cyk
   def __new__(cls,
               input_fn,
+              input_fns=None,
+              start_multi_eval=False,
               steps=100,
               name=None,
               hooks=None,
@@ -230,7 +235,6 @@ class EvalSpec(
     """
     # Validate input_fn.
     _validate_input_fn(input_fn)
-
     # Validate steps.
     if steps is not None and steps <= 0:
       raise ValueError('Must specify steps > 0, given: {}'.format(steps))
@@ -258,6 +262,8 @@ class EvalSpec(
     return super(EvalSpec, cls).__new__(
         cls,
         input_fn=input_fn,
+        input_fns=input_fns,
+        start_multi_eval=start_multi_eval,
         steps=steps,
         name=name,
         hooks=hooks,
@@ -647,7 +653,20 @@ class _TrainingExecutor(object):
   def run_worker(self):
     """Runs task (training) worker."""
     # TODO(xiejw): To allow execution framework to add train hooks.
-    return self._start_distributed_training()
+    # 获取evaluator的数目
+    eval_num = len(self._eval_spec.input_fns)
+    # 获取总共的worker数目
+    # worker_num = self._estimator.config.num_worker_replicas
+    worker_num = 4
+    # 获取用于training的worker数目
+    train_worker_num = worker_num-eval_num+1
+    if(self._eval_spec is not None and self._eval_spec.start_multi_eval
+        and self._estimator.config.task_id >= train_worker_num):
+      logging.info('___________________run_worker with evaluate___________________')
+      return self._start_std_server(self._estimator.config)
+    else:
+      logging.info('___________________run_worker with train___________________')
+      return self._start_distributed_training()
 
   def run_master(self):
     """Runs task master."""
@@ -679,7 +698,13 @@ class _TrainingExecutor(object):
   def run_evaluator(self):
     """Runs task evaluator."""
     # TODO(xiejw): To allow execution framework to add continuous eval listener.
-    return self._start_continuous_evaluation()
+    if(self._eval_spec.start_multi_eval):
+      logging.info('run_evaluator with  multi____________________________')
+      return self._start_continuous_multi_evaluate()
+    else:
+      logging.info('run_evaluator with  single____________________________')
+      return self._start_continuous_evaluation()
+      
 
   def run_ps(self):
     """Runs task parameter server (in training cluster spec)."""
@@ -687,6 +712,7 @@ class _TrainingExecutor(object):
     server = self._start_std_server(config)
     server.join()
 
+  
   def run_local(self):
     """Runs training and evaluation locally (non-distributed)."""
     _assert_eval_spec(self._eval_spec)
@@ -724,7 +750,7 @@ class _TrainingExecutor(object):
       raise RuntimeError('Could not start server; be sure to specify '
                          'cluster_spec, task_type, and task in '
                          'RunConfig or set the TF_CONFIG environment variable.')
-
+    logging.info('***********************cluster_spec={}'.format(config.cluster_spec))
     if not config.master:
       jobs = config.cluster_spec.jobs
       if (len(jobs) == 1 and
@@ -866,6 +892,58 @@ class _TrainingExecutor(object):
           'EvalSpec.throttle_secs is set as 0. This might overload the job '
           'before finding (next) new checkpoint. Please consider to increase '
           'it.')
+    return (eval_result, should_early_stop)
+  # cyk
+  def _start_continuous_multi_evaluate(self):
+    logging.info('______________________start_continuous_multi_evaluate___________________')
+    _assert_eval_spec(self._eval_spec)
+    start_delay_secs = self._eval_spec.start_delay_secs
+    if start_delay_secs:
+      tf.compat.v1.logging.info('Waiting %f secs before starting eval.',
+                                start_delay_secs)
+      time.sleep(start_delay_secs)
+
+    latest_eval_result = None
+    evaluator = _TrainingExecutor._Evaluator(self._estimator, self._eval_spec,
+                                              self._train_spec.max_steps)
+
+    should_early_stop = False
+    while not should_early_stop:
+      if (latest_eval_result and
+          latest_eval_result.status == _EvalStatus.EVALUATED):
+        global_step = latest_eval_result.metrics.get(
+            tf.compat.v1.GraphKeys.GLOBAL_STEP)
+        if (global_step and self.train_spec.max_steps and
+            global_step >= self.train_spec.max_steps):
+          logging.info(
+              'Exiting evaluation, global_step=%s >= train max_steps=%s',
+              global_step, self.train_spec.max_steps)
+          return
+
+      latest_eval_result, should_early_stop = self.start_multi_evaluate_once(
+          evaluator, self._eval_spec.throttle_secs)
+
+  def start_multi_evaluate_once(self,evaluator, throttle_secs):
+    _assert_eval_spec(self._eval_spec)
+
+    start = time.time()
+
+    eval_result = None
+    should_early_stop = False
+
+    eval_result, export_results = evaluator.multi_evaluate_and_export()
+    # Throttle if necessary.
+    elapsed_time = time.time() - start
+    difference = throttle_secs - elapsed_time
+    if difference > 0:
+      logging.info('Waiting %f secs before starting next eval run.', difference)
+      time.sleep(difference)
+    elif (throttle_secs == 0 and eval_result.status != _EvalStatus.EVALUATED):
+      # Prints a user-actionable warning to avoid unnecessary load on evaluator.
+      logging.warning(
+          'EvalSpec.throttle_secs is set as 0. This might overload the job '
+          'before finding (next) new checkpoint. Please consider to increase '
+          'it.')
 
     return (eval_result, should_early_stop)
 
@@ -931,6 +1009,92 @@ class _TrainingExecutor(object):
 
       if is_the_final_export:
         logging.debug('Calling exporter with the `is_the_final_export=True`.')
+        self._is_final_export_triggered = True
+
+      self._last_warning_time = 0
+      self._previous_ckpt_path = latest_ckpt_path
+      return eval_result, export_results
+
+    def multi_evaluate_and_export(self):
+      logging.info('__________________multi_evaluate_and_export_____________________')
+      latest_ckpt_path = self._estimator.latest_checkpoint()
+      if not latest_ckpt_path:
+        self._log_err_msg('Estimator is not trained yet. Will start an '
+                          'evaluation when a checkpoint is ready.')
+        return _EvalResult(status=_EvalStatus.MISSING_CHECKPOINT), []
+
+      if latest_ckpt_path == self._previous_ckpt_path:
+        self._log_err_msg(
+            'No new checkpoint ready for evaluation. Skip the current '
+            'evaluation pass as evaluation results are expected to be same '
+            'for the same checkpoint.')
+        return _EvalResult(status=_EvalStatus.NO_NEW_CHECKPOINT), []
+      with context.graph_mode():
+        with ops.Graph().as_default():
+          total_update_op = []
+          final_ops = {}
+          total_hooks = []
+          logging.info('__________________evaluator start build graph__________________')
+          (scaffold, update_op, eval_dict, all_hooks) = (
+            self._estimator.build_single_graph_evaluate(
+              input_fn=self._eval_spec.input_fns[0],
+              steps=self._eval_spec.steps, 
+              hooks=self._eval_spec.hooks, 
+              checkpoint_path=latest_ckpt_path))
+          total_update_op.append(update_op)
+          final_ops = eval_dict
+          total_hooks.extend(all_hooks)
+          # 获取evaluator的数目
+          eval_num = len(self._eval_spec.input_fns)
+          # 获取总共的worker数目
+          # worker_num = self._estimator.config.num_worker_replicas
+          worker_num = 4
+          # 获取用于training的worker数目
+          train_worker_num = worker_num-eval_num+1
+          logging.info('__________train_worker_num = {} ________eval_num = {}'.format(train_worker_num,eval_num))
+          logging.info('__________________after evaluator__________________')
+          for i in range(eval_num-1):
+            device_name = '/job:worker/task:'+str(train_worker_num+i)
+            with tf.device(device_name):
+              logging.info('__________________worker start build graph__________________')
+              (scaffold_child, update_op_child, eval_dict_child, all_hooks_child) = (
+                self._estimator.build_single_graph_evaluate(
+                input_fn=self._eval_spec.input_fns[i+1],
+                steps=self._eval_spec.steps, 
+                hooks=self._eval_spec.hooks, 
+                checkpoint_path=latest_ckpt_path))
+            total_update_op.append(update_op_child)
+            logging.info('________________________dicts**: %s.', final_ops)
+            for key,val in eval_dict_child.items():
+              if(key != ops.GraphKeys.GLOBAL_STEP):
+                logging.info('__________key = {} ________val = {}'.format(key,val))
+                final_ops[key] = final_ops[key] + val
+            total_hooks.extend(all_hooks_child)
+          logging.info('__________________after worker__________________')
+          for key,val in final_ops.items():
+            if(key != ops.GraphKeys.GLOBAL_STEP):
+              final_ops[key] = val / eval_num
+          
+          metrics = self._estimator._evaluate_run(checkpoint_path=latest_ckpt_path,scaffold=scaffold
+                  ,update_op=total_update_op,eval_dict=final_ops,all_hooks=total_hooks
+                  ,output_dir=self._estimator.eval_dir(self._eval_spec.name))
+      # _EvalResult validates the metrics.
+      eval_result = _EvalResult(
+          status=_EvalStatus.EVALUATED,
+          metrics=metrics,
+          checkpoint_path=latest_ckpt_path)
+
+      is_the_final_export = (
+          eval_result.metrics[tf.compat.v1.GraphKeys.GLOBAL_STEP] >=
+          self._max_training_steps if self._max_training_steps else False)
+          
+      # export_results not be used in later code
+      export_results = self._export_eval_result(eval_result,
+                                                is_the_final_export)
+
+      if is_the_final_export:
+        tf.compat.v1.logging.debug(
+            'Calling exporter with the `is_the_final_export=True`.')
         self._is_final_export_triggered = True
 
       self._last_warning_time = 0
