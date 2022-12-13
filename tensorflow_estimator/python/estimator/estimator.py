@@ -72,6 +72,7 @@ from tensorflow_estimator.python.estimator import run_config
 from tensorflow_estimator.python.estimator import util as estimator_util
 from tensorflow_estimator.python.estimator.export import export_lib
 from tensorflow_estimator.python.estimator.mode_keys import ModeKeys
+from tensorflow_estimator.python.estimator import run_config as run_config_lib
 
 
 _VALID_MODEL_FN_ARGS = set(
@@ -208,6 +209,7 @@ class Estimator(object):
     self._eval_distribution = self._config.eval_distribute
     # Model directory.
     self._model_dir = self._config.model_dir
+    logging.info('Using *config: %s', str(vars(config)))
     self._session_config = self._config.session_config
     logging.info('Using config: %s', str(vars(self._config)))
 
@@ -520,6 +522,24 @@ class Estimator(object):
             return _evaluate()
         else:
           return _evaluate()
+  def build_single_graph_evaluate(self, input_fn, steps=None, hooks=None, checkpoint_path=None):
+    _estimator_api_gauge.get_cell('evaluate').set(True)
+    # with context.graph_mode():
+    hooks = _check_hooks_type(hooks)
+    hooks.extend(self._convert_eval_steps_to_hooks(steps))
+
+    # Check that model has been trained (if nothing has been set explicitly).
+    if not checkpoint_path:
+      latest_path = checkpoint_management.latest_checkpoint(self._model_dir)
+      if not latest_path:
+        tf.compat.v1.logging.info(
+            'Could not find trained model in model_dir: {}, running '
+            'initialization to evaluate.'.format(self._model_dir))
+      checkpoint_path = latest_path
+    def _evaluate():
+      return self._evaluate_build_graph(input_fn, hooks, checkpoint_path)
+      # with ops.Graph().as_default():
+    return _evaluate()
 
   def _convert_eval_steps_to_hooks(self, steps):
     """Create hooks to run correct number of steps in evaluation.
@@ -880,8 +900,7 @@ class Estimator(object):
           gfile.MakeDirs(dest_path)
           gfile.Copy(source, dest_absolute)
 
-      # '/' is needed when rename a oss directory.
-      gfile.Rename(temp_export_dir + '/', export_dir)
+      gfile.Rename(temp_export_dir, export_dir)
       return export_dir
 
   def _add_meta_graph_for_mode(self,
@@ -1505,8 +1524,9 @@ class Estimator(object):
 
   def _evaluate_build_graph(self, input_fn, hooks=None, checkpoint_path=None):
     """Builds the graph and related hooks to run evaluation."""
-    random_seed.set_random_seed(self._config.tf_random_seed)
-    self._create_and_assert_global_step(ops.get_default_graph())
+    if(self.config.task_type is run_config_lib.TaskType.EVALUATOR):
+      random_seed.set_random_seed(self._config.tf_random_seed)
+      self._create_and_assert_global_step(ops.get_default_graph())
 
     if self._eval_distribution:
       (scaffold, evaluation_hooks, input_hooks, update_op, eval_dict) = (
@@ -1524,7 +1544,7 @@ class Estimator(object):
           'Metric with name `global_step` is not allowed, because Estimator '
           'already defines a default metric with the same name.')
     eval_dict[ops.GraphKeys.GLOBAL_STEP] = global_step_tensor
-
+    # logging.info('******************GLOBAL_STEP: %s.', global_step_tensor)
     all_hooks = list(input_hooks)
     all_hooks.extend(hooks)
     all_hooks.extend(list(evaluation_hooks or []))
